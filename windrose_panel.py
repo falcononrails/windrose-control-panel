@@ -42,6 +42,15 @@ _cpu_lock = threading.Lock()
 _last_cpu: tuple[int, int] | None = None
 
 
+def safe_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def run(cmd: list[str], timeout: int = 12) -> dict[str, Any]:
     try:
         proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
@@ -117,10 +126,10 @@ def service_state(service: str) -> dict[str, Any]:
     return {
         "active_state": data.get("ActiveState", "unknown"),
         "sub_state": data.get("SubState", "unknown"),
-        "main_pid": int(data.get("MainPID") or 0),
-        "memory_current": int(data.get("MemoryCurrent") or 0),
+        "main_pid": safe_int(data.get("MainPID")),
+        "memory_current": safe_int(data.get("MemoryCurrent")),
         "active_since": data.get("ActiveEnterTimestamp", ""),
-        "restarts": int(data.get("NRestarts") or 0),
+        "restarts": safe_int(data.get("NRestarts")),
     }
 
 
@@ -754,7 +763,8 @@ INDEX_HTML = r"""<!doctype html>
       const changing = ["activating", "deactivating", "reloading"].includes(service.active_state);
       if (serviceActionPending || changing) return true;
       if (action === "start") return active;
-      if (action === "stop" || action === "restart") return !active;
+      if (action === "stop") return !active;
+      if (action === "restart") return false;
       return false;
     }
     function updateServiceButtons(service) {
@@ -856,7 +866,15 @@ INDEX_HTML = r"""<!doctype html>
       btn.onclick = async () => {
         if (btn.disabled) return;
         const action = btn.dataset.service;
-        if ((action === "stop" || action === "restart") && !confirm(`${action} Windrose server?`)) return;
+        if (action === "stop" || action === "restart") {
+          const count = Number(state?.windrose_plus?.status?.server?.player_count ?? state?.players?.length ?? 0);
+          if (count > 0) {
+            const typed = prompt(`${count} player${count === 1 ? "" : "s"} will be kicked. Type ${action.toUpperCase()} to ${action} the server.`);
+            if (typed !== action.toUpperCase()) return;
+          } else if (!confirm(`${action} Windrose server?`)) {
+            return;
+          }
+        }
         serviceActionPending = true;
         if (state?.services?.windrose) updateServiceButtons(state.services.windrose);
         $("#action-result").textContent = `${action} requested...`;
@@ -946,6 +964,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"{self.address_string()} - {fmt % args}")
+
+    def audit(self, message: str) -> None:
+        print(f"{self.address_string()} - {message}", flush=True)
 
     def cookie_token(self) -> str | None:
         raw = self.headers.get("Cookie", "")
@@ -1064,10 +1085,16 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 current = service_state(SERVICE_NAME)
                 active = current.get("active_state") == "active"
+                status = read_json(DATA_DIR / "server_status.json", {})
+                player_count = safe_int((status.get("server") or {}).get("player_count"))
+                self.audit(
+                    f"service action requested action={action} "
+                    f"state={current.get('active_state')} players={player_count}"
+                )
                 if action == "start" and active:
                     self.send_json({"ok": True, "message": "Server is already running", "state": current})
                     return
-                if action in {"stop", "restart"} and not active:
+                if action == "stop" and not active:
                     self.send_json({"error": "Server is not running", "state": current}, 409)
                     return
                 out = run(["systemctl", action, SERVICE_NAME], timeout=20)
