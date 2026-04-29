@@ -13,6 +13,7 @@ It is designed for community servers that run Windrose+ and optionally WindroseR
 - Create tar.gz backups of save data and server config
 - Run Windrose+ `wp.*` commands through the Windrose+ command spool
 - Use WindroseRCON for `showplayers`, `kick`, `ban`, and `banlist` when the DLL is installed and listening
+- Fill missing Account IDs from recent `R5.log` account records when WindroseRCON returns a player name without an ID
 - Password-protected web UI
 
 ## Requirements
@@ -85,6 +86,8 @@ WindroseRCON is the current open-source path for native kick and ban commands. T
 If it is unavailable, kick and ban buttons are disabled while Windrose+ commands, metrics, config editing, backups, and logs continue to work.
 
 On ARM/Hangover, `dkoz/WindroseRCON` v1.0.2 has been tested with this panel. v1.0.3 crashed during startup on the Oracle ARM test host, so pin v1.0.2 unless a newer release confirms ARM/Hangover compatibility.
+
+Some Windrose builds expose player names through WindroseRCON before they expose Account IDs. The panel falls back to recent game log account records to populate the Account ID column for live player rows.
 
 ## Security
 

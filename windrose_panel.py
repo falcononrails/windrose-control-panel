@@ -301,10 +301,46 @@ def source_rcon_command(command: str) -> dict[str, Any]:
 def parse_source_players(text: str) -> list[dict[str, str]]:
     players = []
     for line in text.splitlines():
-        match = re.search(r"^\s*(?P<name>.+?)\s+-\s+(?P<account>[0-9A-Fa-f]{16,40})\s*$", line)
+        match = re.search(r"^\s*(?P<name>.+?)\s+-\s*(?P<account>[0-9A-Fa-f]{0,40})\s*$", line)
         if match:
             players.append({"name": match.group("name").strip(), "account_id": match.group("account")})
     return players
+
+
+def parse_log_accounts(max_bytes: int = 2_000_000) -> dict[str, dict[str, str]]:
+    log_dir = GAME_DIR / "R5" / "Saved" / "Logs"
+    try:
+        logs = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        logs = []
+    text = tail_file(logs[0], max_bytes) if logs else ""
+    accounts: dict[str, dict[str, str]] = {}
+    patterns = [
+        re.compile(
+            r"Name '(?P<name>[^']+)'\. AccountId '(?P<account>[0-9A-Fa-f]{16,40})'\. State '(?P<state>[^']*)'",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"AccountName '(?P<name>[^']+)'\. AccountId (?P<account>[0-9A-Fa-f]{16,40})",
+            re.IGNORECASE,
+        ),
+    ]
+    for line in text.splitlines():
+        for pat in patterns:
+            match = pat.search(line)
+            if not match:
+                continue
+            name = match.group("name").strip()
+            account = match.group("account").strip()
+            state = match.groupdict().get("state") or ""
+            if name and account:
+                accounts[name.lower()] = {
+                    "name": name,
+                    "account_id": account,
+                    "state": state,
+                    "source": "game_log",
+                }
+    return accounts
 
 
 def windrose_plus_command(command: str, args: list[str] | None = None, timeout: float = 18.0) -> dict[str, Any]:
@@ -425,18 +461,31 @@ def build_state() -> dict[str, Any]:
         res = source_rcon_command("showplayers")
         if res.get("ok"):
             source_players = parse_source_players(res.get("message", ""))
+    log_accounts = parse_log_accounts()
 
     players = status.get("players") or []
     by_name = {p["name"].lower(): p for p in source_players if p.get("name")}
+    for key, item in list(by_name.items()):
+        if not item.get("account_id") and key in log_accounts:
+            item["account_id"] = log_accounts[key]["account_id"]
+            item["account_source"] = "game_log"
     enriched = []
     for p in players:
         item = dict(p)
         src = by_name.get(str(p.get("name", "")).lower())
-        if src:
+        log_src = log_accounts.get(str(p.get("name", "")).lower())
+        if src and src.get("account_id"):
             item["account_id"] = src["account_id"]
+            item["account_source"] = src.get("account_source") or "windrosercon"
+        elif log_src:
+            item["account_id"] = log_src["account_id"]
+            item["account_source"] = "game_log"
         enriched.append(item)
     known_names = {str(p.get("name", "")).lower() for p in enriched}
     for src in source_players:
+        log_src = log_accounts.get(str(src.get("name", "")).lower())
+        if not src.get("account_id") and log_src:
+            src = {**src, "account_id": log_src["account_id"], "account_source": "game_log"}
         if src.get("name", "").lower() not in known_names:
             enriched.append(src)
 
@@ -459,6 +508,7 @@ def build_state() -> dict[str, Any]:
             "livemap_ready": bool(livemap and not livemap.get("error")),
         },
         "source_rcon": source_status,
+        "known_accounts": list(log_accounts.values())[-20:],
         "server_config": server_config(),
         "players": enriched,
     }
@@ -731,7 +781,8 @@ INDEX_HTML = r"""<!doctype html>
           const account = p.account_id || "";
           const pos = p.x !== undefined ? `${Math.round(p.x)}, ${Math.round(p.y)}, ${Math.round(p.z || 0)}` : "-";
           const tr = document.createElement("tr");
-          tr.innerHTML = `<td>${escapeHtml(p.name || "-")}</td><td class="mini">${escapeHtml(account || "-")}</td><td>${escapeHtml(pos)}</td><td>${escapeHtml(p.session || "-")}</td><td class="actions"><div class="row-actions"><button class="button warn">Kick</button><button class="button danger">Ban</button></div></td>`;
+          const source = p.account_source ? ` (${p.account_source})` : "";
+          tr.innerHTML = `<td>${escapeHtml(p.name || "-")}</td><td class="mini">${escapeHtml(account ? account + source : "-")}</td><td>${escapeHtml(pos)}</td><td>${escapeHtml(p.session || "-")}</td><td class="actions"><div class="row-actions"><button class="button warn">Kick</button><button class="button danger">Ban</button></div></td>`;
           const [kick, ban] = tr.querySelectorAll("button");
           kick.disabled = !account || !rcon.available;
           ban.disabled = !account || !rcon.available;
