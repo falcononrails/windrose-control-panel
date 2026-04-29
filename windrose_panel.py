@@ -732,6 +732,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <script>
     let state = null;
+    let serviceActionPending = false;
     const $ = (sel) => document.querySelector(sel);
     const fmtBytes = (n) => {
       if (!n) return "0 B";
@@ -748,6 +749,28 @@ INDEX_HTML = r"""<!doctype html>
     };
     function setText(id, value) { $(id).textContent = value ?? "-"; }
     function servicePill(active) { return active === "active" ? "Online" : active || "Unknown"; }
+    function serviceActionDisabled(action, service) {
+      const active = service.active_state === "active";
+      const changing = ["activating", "deactivating", "reloading"].includes(service.active_state);
+      if (serviceActionPending || changing) return true;
+      if (action === "start") return active;
+      if (action === "stop" || action === "restart") return !active;
+      return false;
+    }
+    function updateServiceButtons(service) {
+      document.querySelectorAll("[data-service]").forEach(btn => {
+        const action = btn.dataset.service;
+        const disabled = serviceActionDisabled(action, service);
+        btn.disabled = disabled;
+        if (disabled) {
+          if (serviceActionPending) btn.title = "Another service action is still pending";
+          else if (action === "start") btn.title = "Server is already running";
+          else btn.title = "Server is not running";
+        } else {
+          btn.removeAttribute("title");
+        }
+      });
+    }
     function render(next) {
       state = next;
       const s = next.windrose_plus.status.server || {};
@@ -768,6 +791,7 @@ INDEX_HTML = r"""<!doctype html>
       setText("#stat-process", `Process ${fmtBytes(proc.rss || service.memory_current || 0)}`);
       setText("#stat-disk", `${disk.percent || 0}%`);
       setText("#stat-backups", fmtBytes(disk.free || 0) + " free");
+      updateServiceButtons(service);
       const rcon = next.source_rcon || {};
       $("#rcon-pill").className = `pill ${rcon.available ? "ok" : "warn"}`;
       $("#rcon-pill").textContent = rcon.available ? "WindroseRCON ready" : "Kick/ban offline";
@@ -830,14 +854,24 @@ INDEX_HTML = r"""<!doctype html>
     });
     document.querySelectorAll("[data-service]").forEach(btn => {
       btn.onclick = async () => {
+        if (btn.disabled) return;
         const action = btn.dataset.service;
         if ((action === "stop" || action === "restart") && !confirm(`${action} Windrose server?`)) return;
+        serviceActionPending = true;
+        if (state?.services?.windrose) updateServiceButtons(state.services.windrose);
         $("#action-result").textContent = `${action} requested...`;
         try {
           const data = await api("/api/service", { method: "POST", body: JSON.stringify({ action }) });
           $("#action-result").textContent = data.message || "Done";
-          setTimeout(refresh, 1500);
-        } catch (e) { $("#action-result").textContent = e.message; }
+          setTimeout(async () => {
+            serviceActionPending = false;
+            await refresh();
+          }, 1500);
+        } catch (e) {
+          serviceActionPending = false;
+          $("#action-result").textContent = e.message;
+          if (state?.services?.windrose) updateServiceButtons(state.services.windrose);
+        }
       };
     });
     $("#backup").onclick = async () => {
@@ -1027,6 +1061,14 @@ class Handler(BaseHTTPRequestHandler):
                 action = str(body.get("action", ""))
                 if action not in {"start", "stop", "restart"}:
                     self.send_json({"error": "Invalid service action"}, 400)
+                    return
+                current = service_state(SERVICE_NAME)
+                active = current.get("active_state") == "active"
+                if action == "start" and active:
+                    self.send_json({"ok": True, "message": "Server is already running", "state": current})
+                    return
+                if action in {"stop", "restart"} and not active:
+                    self.send_json({"error": "Server is not running", "state": current}, 409)
                     return
                 out = run(["systemctl", action, SERVICE_NAME], timeout=20)
                 self.send_json({"ok": out["ok"], "message": out["stderr"] or out["stdout"] or f"{action} sent"}, 200 if out["ok"] else 500)

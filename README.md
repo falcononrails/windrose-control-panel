@@ -9,6 +9,7 @@ It is designed for community servers that run Windrose+ and optionally WindroseR
 - Live Windrose status from Windrose+
 - CPU, memory, disk, process, and service state
 - Start, stop, and restart the Windrose systemd service
+- State-aware service controls that disable invalid actions like starting an already-running server
 - Edit `ServerDescription.json` values such as name, max players, and password
 - Create tar.gz backups of save data and server config
 - Run Windrose+ `wp.*` commands through the Windrose+ command spool
