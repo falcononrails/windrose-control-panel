@@ -1,0 +1,15 @@
+[Unit]
+Description=Windrose Control Panel
+After=network-online.target windrose.service windrose-plus-dashboard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/windrose-panel.env
+WorkingDirectory=/opt/windrose-panel
+ExecStart=/usr/bin/python3 /opt/windrose-panel/windrose_panel.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
