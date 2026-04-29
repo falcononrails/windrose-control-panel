@@ -84,6 +84,8 @@ WindroseRCON is the current open-source path for native kick and ban commands. T
 
 If it is unavailable, kick and ban buttons are disabled while Windrose+ commands, metrics, config editing, backups, and logs continue to work.
 
+On ARM/Hangover, `dkoz/WindroseRCON` v1.0.2 has been tested with this panel. v1.0.3 crashed during startup on the Oracle ARM test host, so pin v1.0.2 unless a newer release confirms ARM/Hangover compatibility.
+
 ## Security
 
 Keep the panel behind a strong password. If you expose it to the internet, restrict the firewall source IPs when possible.
