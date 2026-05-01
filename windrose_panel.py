@@ -37,6 +37,30 @@ SERVICE_NAME = os.getenv("WINDROSE_SERVICE", "windrose.service")
 DASHBOARD_SERVICE = os.getenv("WINDROSE_PLUS_SERVICE", "windrose-plus-dashboard.service")
 SOURCE_RCON_HOST = os.getenv("SOURCE_RCON_HOST", "127.0.0.1")
 SOURCE_RCON_PORT = int(os.getenv("SOURCE_RCON_PORT", "27065"))
+APP_ID = os.getenv("WINDROSE_APP_ID", "4129620")
+INSTALL_PARENT = GAME_DIR.parent
+PIN_FILE = Path(os.getenv("WINDROSE_VERSION_PIN_FILE", str(INSTALL_PARENT / "version-pin.json")))
+UPDATE_LOG = Path(os.getenv("WINDROSE_UPDATE_LOG", "/var/log/windrose-update.log"))
+ROLLBACK_LOG = Path(os.getenv("WINDROSE_ROLLBACK_LOG", "/var/log/windrose-rollback.log"))
+STEAM_LATEST_CACHE = Path(os.getenv("WINDROSE_STEAM_LATEST_CACHE", str(INSTALL_PARENT / "steam-latest.json")))
+SNAPSHOT_PREFIXES = ("server-before-update-", "server-before-rollback-", "server-snapshot-")
+RUNTIME_PATHS = (
+    "R5/Saved",
+    "R5/ServerDescription.json",
+    ".windrose_plus_dashboard_password",
+    "windrose_plus.json",
+    "UE4SS-settings.ini",
+    "WindrosePlus",
+    "windrose_plus",
+    "windrose_plus_data",
+    "server",
+    "tools",
+    "cpp-mods",
+    "R5/Binaries/Win64/dwmapi.dll",
+    "R5/Binaries/Win64/version.dll",
+    "R5/Binaries/Win64/ue4ss",
+    "R5/Binaries/Win64/windrosercon",
+)
 
 _cpu_lock = threading.Lock()
 _last_cpu: tuple[int, int] | None = None
@@ -111,6 +135,356 @@ def tail_file(path: Path, max_bytes: int = 12000) -> str:
             return f.read().decode("utf-8", "replace")
     except Exception:
         return ""
+
+
+def utc_stamp() -> str:
+    return dt.datetime.now(dt.UTC).strftime("%Y%m%d_%H%M%S")
+
+
+def iso_from_ts(ts: float) -> str:
+    return dt.datetime.fromtimestamp(ts, dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def manifest_build(root: Path) -> str:
+    manifest = root / "steamapps" / f"appmanifest_{APP_ID}.acf"
+    text = tail_file(manifest, 20000)
+    match = re.search(r'"buildid"\s+"([^"]+)"', text)
+    return match.group(1) if match else ""
+
+
+def snapshot_version(root: Path) -> str:
+    status = read_json(root / "windrose_plus_data" / "server_status.json", {})
+    server = status.get("server") or {}
+    return str(server.get("version") or "")
+
+
+def snapshot_size(root: Path) -> int:
+    out = run(["du", "-sb", str(root)], timeout=20)
+    if out["ok"] and out["stdout"]:
+        return safe_int(out["stdout"].split()[0])
+    return 0
+
+
+def version_pin() -> dict[str, Any]:
+    data = read_json(PIN_FILE, {})
+    target = str(data.get("target_build") or "latest")
+    return {
+        "target_build": target,
+        "auto_update": target == "latest",
+        "updated_at": data.get("updated_at", ""),
+        "reason": data.get("reason", ""),
+    }
+
+
+def write_version_pin(target_build: str, reason: str) -> dict[str, Any]:
+    target = str(target_build or "latest").strip() or "latest"
+    data = {
+        "target_build": target,
+        "reason": reason,
+        "updated_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    write_json_atomic(PIN_FILE, data)
+    return version_pin()
+
+
+def clear_version_pin() -> dict[str, Any]:
+    write_version_pin("latest", "resume latest auto-update")
+    return version_pin()
+
+
+def append_rollback_log(message: str) -> None:
+    ROLLBACK_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with ROLLBACK_LOG.open("a", encoding="utf-8") as f:
+        f.write(f"[{dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')}] {message}\n")
+
+
+def is_snapshot_name(name: str) -> bool:
+    return any(name.startswith(prefix) for prefix in SNAPSHOT_PREFIXES)
+
+
+def resolve_snapshot(snapshot_id: str) -> Path:
+    name = Path(str(snapshot_id)).name
+    if not is_snapshot_name(name):
+        raise ValueError("Invalid rollback snapshot")
+    path = (INSTALL_PARENT / name).resolve()
+    if path.parent != INSTALL_PARENT.resolve() or not path.is_dir():
+        raise ValueError("Rollback snapshot not found")
+    return path
+
+
+def version_entry(path: Path, live: bool = False) -> dict[str, Any]:
+    try:
+        st = path.stat()
+        created = iso_from_ts(st.st_mtime)
+    except OSError:
+        created = ""
+    return {
+        "id": "__live__" if live else path.name,
+        "path": str(path),
+        "live": live,
+        "source": "current" if live else "saved",
+        "build": manifest_build(path),
+        "version": snapshot_version(path),
+        "created": created,
+        "size": snapshot_size(path),
+    }
+
+
+def list_versions() -> list[dict[str, Any]]:
+    entries = [version_entry(GAME_DIR, live=True)]
+    try:
+        snapshots = sorted(
+            [p for p in INSTALL_PARENT.iterdir() if p.is_dir() and is_snapshot_name(p.name)],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        snapshots = []
+    entries.extend(version_entry(path) for path in snapshots)
+    return entries
+
+
+def list_saved_versions() -> list[dict[str, Any]]:
+    versions = list_versions()
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in versions:
+        build = str(item.get("build") or "")
+        key = build or str(item.get("path") or item.get("id") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(item)
+    return selected
+
+
+def steam_latest_state() -> dict[str, Any]:
+    data = read_json(STEAM_LATEST_CACHE, {})
+    return {
+        "app_id": APP_ID,
+        "latest_build": str(data.get("latest_build") or ""),
+        "checked_at": data.get("checked_at", ""),
+        "error": data.get("error", ""),
+    }
+
+
+def check_steam_latest() -> dict[str, Any]:
+    out = run(["/usr/local/bin/windrose-latest-build"], timeout=220)
+    latest = re.sub(r"\D", "", out.get("stdout", "").splitlines()[-1] if out.get("stdout") else "")
+    data = {
+        "latest_build": latest,
+        "checked_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "error": "" if out["ok"] and latest else (out.get("stderr") or out.get("stdout") or "Could not read Steam latest build"),
+    }
+    write_json_atomic(STEAM_LATEST_CACHE, data)
+    return steam_latest_state()
+
+
+def snapshot_history_event(path: Path) -> dict[str, Any]:
+    item = version_entry(path)
+    name = path.name
+    if name.startswith("server-before-update-"):
+        action = "Saved before update"
+    elif name.startswith("server-before-rollback-"):
+        action = "Saved before switch"
+    elif name.startswith("server-snapshot-manual-"):
+        action = "Manual snapshot"
+    elif name.startswith("server-snapshot-pre-update-"):
+        action = "Saved before update"
+    else:
+        action = "Saved install"
+    return {
+        "time": item.get("created", ""),
+        "action": action,
+        "build": item.get("build", ""),
+        "version": item.get("version", ""),
+        "detail": name,
+    }
+
+
+def rollback_log_history(max_lines: int = 80) -> list[dict[str, str]]:
+    events: list[dict[str, str]] = []
+    pattern = re.compile(r"^\[(?P<time>[^\]]+)\]\s+(?P<message>.*)$")
+    for line in tail_file(ROLLBACK_LOG, 32000).splitlines()[-max_lines:]:
+        match = pattern.match(line.strip())
+        if not match:
+            continue
+        message = match.group("message")
+        action = "Version activity"
+        build = ""
+        detail = message
+        target = re.search(r"target_build=([0-9]+)", message)
+        active = re.search(r"active_build=([0-9]+)", message)
+        if target:
+            build = target.group(1)
+        elif active:
+            build = active.group(1)
+        if message.startswith("rollback start"):
+            action = "Switch started"
+            detail = "Preparing install swap"
+        elif message.startswith("rollback complete"):
+            action = "Switch complete"
+            detail = "Server start requested"
+        elif message.startswith("rollback service start requested"):
+            action = "Server start requested"
+            detail = "Starting selected version"
+        elif "latest auto-update resumed" in message:
+            action = "Auto-update resumed"
+            detail = "Tracking latest Steam build"
+        elif message.startswith("manual recovery"):
+            action = "Manual recovery"
+        events.append({
+            "time": match.group("time"),
+            "action": action,
+            "build": build,
+            "version": "",
+            "detail": detail,
+        })
+    return events
+
+
+def version_history() -> list[dict[str, str]]:
+    events: list[dict[str, str]] = []
+    try:
+        snapshots = [p for p in INSTALL_PARENT.iterdir() if p.is_dir() and is_snapshot_name(p.name)]
+    except Exception:
+        snapshots = []
+    events.extend(snapshot_history_event(path) for path in snapshots)
+    events.extend(rollback_log_history())
+    return sorted(events, key=lambda item: item.get("time", ""), reverse=True)[:40]
+
+
+def versions_state() -> dict[str, Any]:
+    return {
+        "pin": version_pin(),
+        "steam": steam_latest_state(),
+        "versions": list_saved_versions(),
+        "history": version_history(),
+        "logs": {
+            "update": str(UPDATE_LOG),
+            "rollback": str(ROLLBACK_LOG),
+        },
+    }
+
+
+def create_install_snapshot(reason: str = "manual") -> dict[str, Any]:
+    build = manifest_build(GAME_DIR) or "unknown"
+    safe_reason = re.sub(r"[^a-z0-9-]+", "-", reason.lower()).strip("-") or "manual"
+    target = INSTALL_PARENT / f"server-snapshot-{safe_reason}-{build}-{utc_stamp()}"
+    if target.exists():
+        raise ValueError("Snapshot target already exists")
+    append_rollback_log(f"snapshot start target={target}")
+    out = run(["cp", "-a", str(GAME_DIR), str(target)], timeout=900)
+    if not out["ok"]:
+        append_rollback_log(f"snapshot failed target={target} error={out['stderr'] or out['stdout']}")
+        raise RuntimeError(out["stderr"] or out["stdout"] or "Snapshot failed")
+    run(["chown", "-R", "ubuntu:ubuntu", str(target)], timeout=180)
+    append_rollback_log(f"snapshot complete target={target} build={build}")
+    return version_entry(target)
+
+
+def copy_runtime_data(src_root: Path, dst_root: Path) -> None:
+    for rel in RUNTIME_PATHS:
+        src = src_root / rel
+        dst = dst_root / rel
+        if not src.exists() and not src.is_symlink():
+            continue
+        if dst.exists() or dst.is_symlink():
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            else:
+                dst.unlink()
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir() and not src.is_symlink():
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            shutil.copy2(src, dst, follow_symlinks=False)
+
+
+def clear_volatile_runtime(root: Path) -> None:
+    data_dir = root / "windrose_plus_data"
+    for rel in (
+        "server_status.json",
+        "rcon_status.json",
+        "pending_commands.txt",
+    ):
+        try:
+            (data_dir / rel).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            append_rollback_log(f"could not clear volatile file {data_dir / rel}: {exc}")
+    rcon_dir = data_dir / "rcon"
+    if rcon_dir.exists():
+        for pattern in ("cmd_*.json", "res_*.json"):
+            for path in rcon_dir.glob(pattern):
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    append_rollback_log(f"could not clear volatile rcon file {path}: {exc}")
+
+
+def rollback_to_snapshot(snapshot_id: str) -> dict[str, Any]:
+    snapshot = resolve_snapshot(snapshot_id)
+    target_build = manifest_build(snapshot)
+    if not target_build:
+        raise ValueError("Selected snapshot has no Steam build manifest")
+
+    status = read_json(DATA_DIR / "server_status.json", {})
+    player_count = safe_int((status.get("server") or {}).get("player_count"))
+    if player_count > 0:
+        append_rollback_log(f"rollback requested with players_online={player_count}")
+
+    backup = create_backup()
+    if not backup.get("ok"):
+        raise RuntimeError("Pre-rollback backup failed: " + str(backup.get("error") or "unknown error"))
+
+    current_build = manifest_build(GAME_DIR) or "unknown"
+    stamp = utc_stamp()
+    current_snapshot = INSTALL_PARENT / f"server-before-rollback-{current_build}-{stamp}"
+    stage = INSTALL_PARENT / f"server-rollback-stage-{target_build}-{stamp}"
+    append_rollback_log(
+        f"rollback start selected={snapshot} target_build={target_build} "
+        f"current_build={current_build} save_backup={backup.get('path')}"
+    )
+
+    stop = run(["systemctl", "stop", SERVICE_NAME], timeout=90)
+    if not stop["ok"]:
+        append_rollback_log(f"rollback stop failed error={stop['stderr'] or stop['stdout']}")
+        raise RuntimeError(stop["stderr"] or stop["stdout"] or "Failed to stop Windrose")
+
+    try:
+        stage.mkdir(parents=True)
+        copy = run(["cp", "-a", f"{snapshot}/.", str(stage)], timeout=900)
+        if not copy["ok"]:
+            raise RuntimeError(copy["stderr"] or copy["stdout"] or "Failed to stage rollback snapshot")
+        copy_runtime_data(GAME_DIR, stage)
+        clear_volatile_runtime(stage)
+        shutil.move(str(GAME_DIR), str(current_snapshot))
+        shutil.move(str(stage), str(GAME_DIR))
+        run(["chown", "-R", "ubuntu:ubuntu", str(GAME_DIR), str(current_snapshot), str(snapshot)], timeout=240)
+        write_version_pin(target_build, f"rollback to {snapshot.name}")
+    except Exception as exc:
+        append_rollback_log(f"rollback swap failed error={exc}")
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+    append_rollback_log(f"rollback service start requested build={target_build}")
+    start = run(["systemctl", "start", "--no-block", SERVICE_NAME], timeout=20)
+    if not start["ok"]:
+        append_rollback_log(f"rollback start failed error={start['stderr'] or start['stdout']}")
+        raise RuntimeError(start["stderr"] or start["stdout"] or "Rollback swapped files but service did not start")
+
+    append_rollback_log(f"rollback complete active_build={target_build} previous_saved={current_snapshot}")
+    return {
+        "ok": True,
+        "build": target_build,
+        "previous_snapshot": str(current_snapshot),
+        "save_backup": backup.get("path"),
+        "pin": version_pin(),
+        "message": f"Switched to build {target_build}. Auto-update is pinned until you resume latest.",
+    }
 
 
 def service_state(service: str) -> dict[str, Any]:
@@ -445,7 +819,7 @@ def update_server_config(body: dict[str, Any]) -> dict[str, Any]:
 
 def create_backup() -> dict[str, Any]:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = utc_stamp()
     target = BACKUP_DIR / f"windrose-panel-{ts}.tar.gz"
     includes = [
         "R5/ServerDescription.json",
@@ -519,6 +893,7 @@ def build_state() -> dict[str, Any]:
         "source_rcon": source_status,
         "known_accounts": list(log_accounts.values())[-20:],
         "server_config": server_config(),
+        "versions": versions_state(),
         "players": enriched,
     }
 
@@ -631,6 +1006,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .tab { display: none; }
     .tab.active { display: block; }
+    .section-title { margin: 0 0 10px; font-size: 15px; line-height: 1.2; }
     .mini { color: var(--muted); font-size: 12px; }
     .right { display: flex; gap: 8px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
     @media (max-width: 960px) {
@@ -652,6 +1028,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="active" data-tab="overview">Overview</button>
         <button data-tab="players">Players</button>
         <button data-tab="config">Config</button>
+        <button data-tab="versions">Versions</button>
         <button data-tab="console">Console</button>
         <button data-tab="logs">Logs</button>
       </nav>
@@ -708,6 +1085,41 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </section>
 
+      <section class="tab" id="tab-versions">
+        <div class="grid">
+          <div class="card">
+            <div class="toolbar" style="margin-bottom:10px">
+              <button class="button" id="refresh-versions">Refresh Versions</button>
+              <button class="button" id="check-steam">Check Steam Latest</button>
+              <button class="button" id="create-snapshot">Create Snapshot</button>
+              <button class="button primary" id="resume-latest">Resume Latest Auto-update</button>
+            </div>
+            <div class="toolbar">
+              <span class="pill" id="steam-latest-pill">Steam latest not checked</span>
+              <span class="pill warn" id="version-pin-alert">Loading version pin...</span>
+            </div>
+          </div>
+          <div class="card">
+            <h2 class="section-title">Saved Versions</h2>
+            <table>
+              <thead><tr><th>Status</th><th>Steam Build</th><th>Game Version</th><th>Saved</th><th>Size</th><th>Action</th></tr></thead>
+              <tbody id="versions-body"></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <div class="toolbar" style="margin-bottom:10px">
+              <h2 class="section-title" style="margin-right:auto">Activity History</h2>
+              <button class="button" id="refresh-version-logs">Refresh Raw Logs</button>
+            </div>
+            <table>
+              <thead><tr><th>Time</th><th>Action</th><th>Steam Build</th><th>Game Version</th><th>Detail</th></tr></thead>
+              <tbody id="version-history-body"></tbody>
+            </table>
+            <pre id="version-logs-output" style="display:none; margin-top:12px"></pre>
+          </div>
+        </div>
+      </section>
+
       <section class="tab" id="tab-console">
         <div class="grid two">
           <div class="card">
@@ -750,6 +1162,20 @@ INDEX_HTML = r"""<!doctype html>
       while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
       return `${v.toFixed(i ? 1 : 0)} ${units[i]}`;
     };
+    const fmtDate = (value) => {
+      if (!value) return "-";
+      const text = String(value).trim();
+      const date = new Date(text);
+      if (Number.isNaN(date.getTime())) return text;
+      return new Intl.DateTimeFormat(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZoneName: "short"
+      }).format(date);
+    };
     const api = async (url, opts = {}) => {
       const res = await fetch(url, { credentials: "same-origin", headers: { "Content-Type": "application/json" }, ...opts });
       const data = await res.json().catch(() => ({}));
@@ -781,18 +1207,76 @@ INDEX_HTML = r"""<!doctype html>
         }
       });
     }
+    function renderVersions(next) {
+      const versions = next.versions || {};
+      const pin = versions.pin || {};
+      const steam = versions.steam || {};
+      const rows = versions.versions || [];
+      const history = versions.history || [];
+      const live = rows.find(v => v.live) || rows[0] || {};
+      const body = $("#versions-body");
+      body.innerHTML = "";
+      $("#resume-latest").disabled = pin.auto_update !== false;
+      const steamEl = $("#steam-latest-pill");
+      if (steam.error) {
+        steamEl.className = "pill warn";
+        steamEl.textContent = `Steam latest check failed`;
+      } else if (steam.latest_build) {
+        const checked = steam.checked_at ? ` · checked ${fmtDate(steam.checked_at)}` : "";
+        steamEl.className = steam.latest_build === live.build ? "pill ok" : "pill warn";
+        steamEl.textContent = `Steam latest ${steam.latest_build}${checked}`;
+      } else {
+        steamEl.className = "pill";
+        steamEl.textContent = "Steam latest not checked";
+      }
+      const pinEl = $("#version-pin-alert");
+      if (pin.auto_update === false) {
+        pinEl.className = "pill warn";
+        pinEl.textContent = `Pinned to ${pin.target_build}. Latest auto-update is paused.`;
+      } else {
+        pinEl.className = "pill ok";
+        pinEl.textContent = "Tracking latest Steam build automatically.";
+      }
+      if (!rows.length) {
+        body.innerHTML = `<tr><td colspan="6" class="mini">No versions found</td></tr>`;
+        return;
+      }
+      for (const item of rows) {
+        const tr = document.createElement("tr");
+        const stateLabel = item.live ? "Current" : "Saved locally";
+        const action = item.live ? `<span class="mini">Running now</span>` : `<button class="button warn">Switch</button>`;
+        tr.innerHTML = `<td>${escapeHtml(stateLabel)}</td><td>${escapeHtml(item.build || "-")}</td><td>${escapeHtml(item.version || "-")}</td><td class="mini" title="${escapeHtml(item.created || "")}">${escapeHtml(fmtDate(item.created))}</td><td>${fmtBytes(item.size || 0)}</td><td>${action}</td>`;
+        const btn = tr.querySelector("button");
+        if (btn) {
+          btn.onclick = () => rollbackVersion(item, live);
+        }
+        body.appendChild(tr);
+      }
+      const historyBody = $("#version-history-body");
+      historyBody.innerHTML = "";
+      if (!history.length) {
+        historyBody.innerHTML = `<tr><td colspan="5" class="mini">No version activity yet</td></tr>`;
+      } else {
+        for (const item of history) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td class="mini" title="${escapeHtml(item.time || "")}">${escapeHtml(fmtDate(item.time))}</td><td>${escapeHtml(item.action || "-")}</td><td>${escapeHtml(item.build || "-")}</td><td>${escapeHtml(item.version || "-")}</td><td class="mini">${escapeHtml(item.detail || "-")}</td>`;
+          historyBody.appendChild(tr);
+        }
+      }
+    }
     function render(next) {
       state = next;
       const s = next.windrose_plus.status.server || {};
+      const liveVersion = ((next.versions || {}).versions || [])[0] || {};
       const service = next.services.windrose || {};
       const mem = next.host.memory || {};
       const disk = next.host.disk || {};
       const proc = next.host.process || {};
       const cfg = next.server_config || {};
       $("#server-name").textContent = s.name || cfg.server_name || "Windrose";
-      $("#server-line").textContent = `Invite ${s.invite_code || cfg.invite_code || "-"} · Version ${s.version || "-"} · Windrose+ ${s.windrose_plus || "-"}`;
+      $("#server-line").textContent = `Invite ${s.invite_code || cfg.invite_code || "-"} · Version ${s.version || "-"} · Steam build ${liveVersion.build || "-"} · Windrose+ ${s.windrose_plus || "-"}`;
       setText("#stat-service", servicePill(service.active_state));
-      setText("#stat-uptime", service.active_since || "-");
+      setText("#stat-uptime", fmtDate(service.active_since));
       setText("#stat-players", `${s.player_count ?? 0}/${s.max_players ?? cfg.max_players ?? 0}`);
       setText("#stat-invite", `Invite ${s.invite_code || cfg.invite_code || "-"}`);
       setText("#stat-cpu", `${next.host.cpu_percent || 0}%`);
@@ -833,6 +1317,7 @@ INDEX_HTML = r"""<!doctype html>
       form.max_players.value = cfg.max_players || 10;
       form.password_protected.value = String(!!cfg.password_protected);
       form.password.value = cfg.password || "";
+      renderVersions(next);
     }
     function escapeHtml(v) {
       return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
@@ -846,6 +1331,58 @@ INDEX_HTML = r"""<!doctype html>
         const data = await api("/api/logs");
         $("#logs-output").textContent = data.logs || "";
       } catch (e) { $("#logs-output").textContent = e.message; }
+    }
+    async function loadVersionLogs() {
+      try {
+        const data = await api("/api/version-logs");
+        $("#version-logs-output").textContent = data.logs || "";
+        $("#version-logs-output").style.display = $("#version-logs-output").style.display === "none" ? "block" : "none";
+      } catch (e) { $("#version-logs-output").textContent = e.message; }
+    }
+    async function refreshVersions() {
+      await refresh();
+    }
+    async function createSnapshot() {
+      $("#action-result").textContent = "Creating version snapshot...";
+      try {
+        const data = await api("/api/version-snapshot", { method: "POST", body: "{}" });
+        $("#action-result").textContent = `Snapshot created for build ${data.build || "-"} (${fmtBytes(data.size || 0)})`;
+        await refreshVersions();
+      } catch (e) { $("#action-result").textContent = e.message; }
+    }
+    async function checkSteamLatest() {
+      $("#action-result").textContent = "Checking Steam latest build...";
+      try {
+        const data = await api("/api/check-steam-latest", { method: "POST", body: "{}" });
+        $("#action-result").textContent = data.error ? `Steam check failed: ${data.error}` : `Steam latest build ${data.latest_build || "-"}`;
+        await refresh();
+      } catch (e) { $("#action-result").textContent = e.message; }
+    }
+    async function resumeLatest() {
+      if (!confirm("Resume latest auto-update? The next idle update check may restart the server if Steam has a newer build.")) return;
+      try {
+        const data = await api("/api/resume-latest", { method: "POST", body: "{}" });
+        $("#action-result").textContent = data.message || "Latest auto-update resumed";
+        await refreshVersions();
+      } catch (e) { $("#action-result").textContent = e.message; }
+    }
+    async function rollbackVersion(item, live) {
+      const count = Number(state?.windrose_plus?.status?.server?.player_count ?? state?.players?.length ?? 0);
+      let confirmPlayers = false;
+      const label = `${item.version || "unknown version"} / build ${item.build || "-"}`;
+      if (count > 0) {
+        const typed = prompt(`${count} player${count === 1 ? "" : "s"} will be disconnected. Type ROLLBACK to switch to ${label}.`);
+        if (typed !== "ROLLBACK") return;
+        confirmPlayers = true;
+      } else if (!confirm(`Roll back to ${label}? The server will stop, swap versions, then start again.`)) {
+        return;
+      }
+      $("#action-result").textContent = `Switching to build ${item.build || "-"}...`;
+      try {
+        const data = await api("/api/rollback", { method: "POST", body: JSON.stringify({ snapshot_id: item.id, confirm_players: confirmPlayers }) });
+        $("#action-result").textContent = data.message || "Version switch complete";
+        await refreshVersions();
+      } catch (e) { $("#action-result").textContent = e.message; }
     }
     async function playerAction(action, account_id, reason = "") {
       try {
@@ -923,6 +1460,11 @@ INDEX_HTML = r"""<!doctype html>
     };
     $("#refresh").onclick = refresh;
     $("#refresh-logs").onclick = loadLogs;
+    $("#refresh-versions").onclick = refreshVersions;
+    $("#refresh-version-logs").onclick = loadVersionLogs;
+    $("#check-steam").onclick = checkSteamLatest;
+    $("#create-snapshot").onclick = createSnapshot;
+    $("#resume-latest").onclick = resumeLatest;
     $("#logout").onclick = async () => { await fetch("/logout", { method: "POST" }); location.href = "/login"; };
     refresh();
     setInterval(refresh, 5000);
@@ -1031,6 +1573,22 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.send_json(build_state())
                 return
+            if path == "/api/versions":
+                if not self.require_auth():
+                    return
+                self.send_json(versions_state())
+                return
+            if path == "/api/version-logs":
+                if not self.require_auth():
+                    return
+                logs = (
+                    "--- Update log ---\n"
+                    + tail_file(UPDATE_LOG, 16000)
+                    + "\n\n--- Rollback log ---\n"
+                    + tail_file(ROLLBACK_LOG, 16000)
+                )
+                self.send_json({"logs": logs.strip()})
+                return
             if path == "/api/logs":
                 if not self.require_auth():
                     return
@@ -1106,6 +1664,29 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/backup":
                 result = create_backup()
                 self.send_json(result, 200 if result.get("ok") else 500)
+                return
+            if path == "/api/version-snapshot":
+                result = create_install_snapshot("manual")
+                self.send_json({"ok": True, **result})
+                return
+            if path == "/api/check-steam-latest":
+                result = check_steam_latest()
+                self.send_json(result, 200 if not result.get("error") else 502)
+                return
+            if path == "/api/resume-latest":
+                pin = clear_version_pin()
+                append_rollback_log("latest auto-update resumed from panel")
+                self.send_json({"ok": True, "pin": pin, "message": "Latest auto-update resumed"})
+                return
+            if path == "/api/rollback":
+                snapshot_id = str(body.get("snapshot_id", ""))
+                status = read_json(DATA_DIR / "server_status.json", {})
+                player_count = safe_int((status.get("server") or {}).get("player_count"))
+                if player_count > 0 and not body.get("confirm_players"):
+                    self.send_json({"error": f"{player_count} players are online; confirmation is required"}, 409)
+                    return
+                result = rollback_to_snapshot(snapshot_id)
+                self.send_json(result)
                 return
             if path == "/api/rcon":
                 command = str(body.get("command", "")).strip()
