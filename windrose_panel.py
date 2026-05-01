@@ -1172,8 +1172,7 @@ INDEX_HTML = r"""<!doctype html>
         month: "short",
         day: "numeric",
         hour: "2-digit",
-        minute: "2-digit",
-        timeZoneName: "short"
+        minute: "2-digit"
       }).format(date);
     };
     const api = async (url, opts = {}) => {
