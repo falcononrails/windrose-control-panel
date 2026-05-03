@@ -155,7 +155,12 @@ def manifest_build(root: Path) -> str:
 def snapshot_version(root: Path) -> str:
     status = read_json(root / "windrose_plus_data" / "server_status.json", {})
     server = status.get("server") or {}
-    return str(server.get("version") or "")
+    version = str(server.get("version") or "")
+    if version:
+        return version
+    cfg = read_json(root / "R5" / "ServerDescription.json", {})
+    deployment = str(cfg.get("DeploymentId") or "")
+    return deployment.split("-", 1)[0] if deployment else ""
 
 
 def snapshot_size(root: Path) -> int:
@@ -387,13 +392,13 @@ def copy_runtime_data(src_root: Path, dst_root: Path) -> None:
     for rel in RUNTIME_PATHS:
         src = src_root / rel
         dst = dst_root / rel
-        if not src.exists() and not src.is_symlink():
-            continue
         if dst.exists() or dst.is_symlink():
             if dst.is_dir() and not dst.is_symlink():
                 shutil.rmtree(dst)
             else:
                 dst.unlink()
+        if not src.exists() and not src.is_symlink():
+            continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src.is_dir() and not src.is_symlink():
             shutil.copytree(src, dst, symlinks=True)
@@ -430,8 +435,7 @@ def rollback_to_snapshot(snapshot_id: str) -> dict[str, Any]:
     if not target_build:
         raise ValueError("Selected snapshot has no Steam build manifest")
 
-    status = read_json(DATA_DIR / "server_status.json", {})
-    player_count = safe_int((status.get("server") or {}).get("player_count"))
+    player_count = live_player_count()
     if player_count > 0:
         append_rollback_log(f"rollback requested with players_online={player_count}")
 
@@ -726,7 +730,64 @@ def parse_log_accounts(max_bytes: int = 2_000_000) -> dict[str, dict[str, str]]:
     return accounts
 
 
+def mod_layer_state(dashboard_state: dict[str, Any] | None = None) -> dict[str, Any]:
+    win64 = GAME_DIR / "R5" / "Binaries" / "Win64"
+    hook_paths = [
+        win64 / "dwmapi.dll",
+        win64 / "version.dll",
+        win64 / "ue4ss",
+    ]
+    windrose_plus_hook = win64 / "ue4ss" / "Mods" / "WindrosePlus" / "enabled.txt"
+    source_rcon_dir = win64 / "windrosercon"
+    dashboard = dashboard_state or service_state(DASHBOARD_SERVICE)
+    hook_installed = any(path.exists() for path in hook_paths)
+    windrose_plus_installed = windrose_plus_hook.exists()
+    source_rcon_installed = source_rcon_dir.exists()
+    dashboard_running = dashboard.get("active_state") == "active"
+    return {
+        "mode": "modded" if hook_installed or dashboard_running or source_rcon_installed else "vanilla",
+        "hook_installed": hook_installed,
+        "windrose_plus_installed": windrose_plus_installed,
+        "windrose_plus_dashboard_running": dashboard_running,
+        "source_rcon_installed": source_rcon_installed,
+        "live_players": bool(windrose_plus_installed and dashboard_running),
+        "admin_actions": bool(source_rcon_installed),
+        "console": bool(windrose_plus_installed or source_rcon_installed),
+    }
+
+
+def config_version(cfg: dict[str, Any]) -> str:
+    deployment = str((cfg.get("raw") or {}).get("DeploymentId") or "")
+    return deployment.split("-", 1)[0] if deployment else ""
+
+
+def effective_server_status(status: dict[str, Any], capabilities: dict[str, Any]) -> dict[str, Any]:
+    cfg = server_config()
+    server = status.get("server") if capabilities.get("live_players") else {}
+    if not isinstance(server, dict):
+        server = {}
+    return {
+        "name": server.get("name") or cfg.get("server_name") or "Windrose",
+        "invite_code": server.get("invite_code") or cfg.get("invite_code") or "",
+        "version": server.get("version") or cfg.get("deployment_version") or "",
+        "windrose_plus": server.get("windrose_plus") if capabilities.get("live_players") else "",
+        "player_count": safe_int(server.get("player_count"), 0) if capabilities.get("live_players") else None,
+        "max_players": safe_int(server.get("max_players"), safe_int(cfg.get("max_players"))),
+    }
+
+
+def live_player_count() -> int:
+    dashboard = service_state(DASHBOARD_SERVICE)
+    capabilities = mod_layer_state(dashboard)
+    if not capabilities.get("live_players"):
+        return 0
+    status = read_json(DATA_DIR / "server_status.json", {})
+    return safe_int((status.get("server") or {}).get("player_count"))
+
+
 def windrose_plus_command(command: str, args: list[str] | None = None, timeout: float = 18.0) -> dict[str, Any]:
+    if not mod_layer_state().get("windrose_plus_installed"):
+        return {"ok": False, "status": "error", "message": "Windrose+ is disabled; commands are unavailable in vanilla mode"}
     password = get_windrose_plus_password()
     if not password or password == "changeme":
         return {"ok": False, "status": "error", "message": "Windrose+ RCON password is not configured"}
@@ -767,7 +828,7 @@ def windrose_plus_command(command: str, args: list[str] | None = None, timeout: 
 def server_config() -> dict[str, Any]:
     cfg = read_json(SERVER_DESC, {})
     persistent = cfg.get("ServerDescription_Persistent") or {}
-    return {
+    result = {
         "raw": cfg,
         "server_name": persistent.get("ServerName", ""),
         "invite_code": persistent.get("InviteCode", ""),
@@ -777,6 +838,8 @@ def server_config() -> dict[str, Any]:
         "region": persistent.get("UserSelectedRegion", ""),
         "use_direct_connection": bool(persistent.get("UseDirectConnection", False)),
     }
+    result["deployment_version"] = config_version(result)
+    return result
 
 
 def update_server_config(body: dict[str, Any]) -> dict[str, Any]:
@@ -821,12 +884,15 @@ def create_backup() -> dict[str, Any]:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     ts = utc_stamp()
     target = BACKUP_DIR / f"windrose-panel-{ts}.tar.gz"
-    includes = [
+    desired_includes = [
         "R5/ServerDescription.json",
         "R5/Saved/SaveProfiles",
         "windrose_plus.json",
         "windrose_plus_data",
     ]
+    includes = [rel for rel in desired_includes if (GAME_DIR / rel).exists()]
+    if not includes:
+        return {"ok": False, "error": "No backup paths were found"}
     cmd = ["tar", "-czf", str(target), "-C", str(GAME_DIR)] + includes
     out = run(cmd, timeout=180)
     if not out["ok"]:
@@ -835,16 +901,26 @@ def create_backup() -> dict[str, Any]:
 
 
 def build_state() -> dict[str, Any]:
-    status = read_json(DATA_DIR / "server_status.json", {})
-    livemap = read_json(DATA_DIR / "livemap_data.json", {})
-    rcon_status = read_json(DATA_DIR / "rcon_status.json", {})
-    source_status = source_rcon_status()
+    windrose_service = service_state(SERVICE_NAME)
+    dashboard_service = service_state(DASHBOARD_SERVICE)
+    capabilities = mod_layer_state(dashboard_service)
+    raw_status = read_json(DATA_DIR / "server_status.json", {})
+    status = raw_status if capabilities.get("live_players") else {}
+    server_status = effective_server_status(status, capabilities)
+    livemap = read_json(DATA_DIR / "livemap_data.json", {}) if capabilities.get("live_players") else {}
+    rcon_status = read_json(DATA_DIR / "rcon_status.json", {}) if capabilities.get("live_players") else {}
+    source_status = source_rcon_status() if capabilities.get("admin_actions") else {
+        "available": False,
+        "reason": "vanilla_mode",
+        "host": SOURCE_RCON_HOST,
+        "port": SOURCE_RCON_PORT,
+    }
     source_players: list[dict[str, str]] = []
     if source_status.get("available"):
         res = source_rcon_command("showplayers")
         if res.get("ok"):
             source_players = parse_source_players(res.get("message", ""))
-    log_accounts = parse_log_accounts()
+    log_accounts = parse_log_accounts() if capabilities.get("admin_actions") else {}
 
     players = status.get("players") or []
     by_name = {p["name"].lower(): p for p in source_players if p.get("name")}
@@ -875,9 +951,10 @@ def build_state() -> dict[str, Any]:
     return {
         "now": int(time.time()),
         "services": {
-            "windrose": service_state(SERVICE_NAME),
-            "windrose_plus": service_state(DASHBOARD_SERVICE),
+            "windrose": windrose_service,
+            "windrose_plus": dashboard_service,
         },
+        "capabilities": capabilities,
         "host": {
             "cpu_percent": cpu_percent(),
             "load": os.getloadavg() if hasattr(os, "getloadavg") else [0, 0, 0],
@@ -886,7 +963,7 @@ def build_state() -> dict[str, Any]:
             "process": process_info(),
         },
         "windrose_plus": {
-            "status": status,
+            "status": {"server": server_status, "raw": raw_status if capabilities.get("live_players") else {}},
             "rcon_status": rcon_status,
             "livemap_ready": bool(livemap and not livemap.get("error")),
         },
@@ -992,6 +1069,7 @@ INDEX_HTML = r"""<!doctype html>
     th { color: var(--muted); font-size: 12px; text-transform: uppercase; font-weight: 650; }
     td.actions { width: 180px; }
     .row-actions { display: flex; gap: 6px; }
+    .notice { border: 1px solid #86643a; color: #ffe0a6; background: #1b1710; border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; }
     .form { display: grid; gap: 12px; max-width: 680px; }
     label { display: grid; gap: 6px; color: var(--muted); }
     input, select, textarea {
@@ -1063,6 +1141,7 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="tab" id="tab-players">
+        <div class="notice" id="players-notice" style="display:none"></div>
         <div class="card">
           <table>
             <thead><tr><th>Name</th><th>Account ID</th><th>Position</th><th>Session</th><th>Actions</th></tr></thead>
@@ -1121,6 +1200,7 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section class="tab" id="tab-console">
+        <div class="notice" id="console-notice" style="display:none"></div>
         <div class="grid two">
           <div class="card">
             <div class="split">
@@ -1206,6 +1286,10 @@ INDEX_HTML = r"""<!doctype html>
         }
       });
     }
+    function livePlayerCountForPrompt() {
+      if (!state?.capabilities?.live_players) return null;
+      return Number(state?.windrose_plus?.status?.server?.player_count ?? state?.players?.length ?? 0);
+    }
     function renderVersions(next) {
       const versions = next.versions || {};
       const pin = versions.pin || {};
@@ -1272,12 +1356,14 @@ INDEX_HTML = r"""<!doctype html>
       const disk = next.host.disk || {};
       const proc = next.host.process || {};
       const cfg = next.server_config || {};
+      const caps = next.capabilities || {};
       $("#server-name").textContent = s.name || cfg.server_name || "Windrose";
-      $("#server-line").textContent = `Invite ${s.invite_code || cfg.invite_code || "-"} · Version ${s.version || "-"} · Steam build ${liveVersion.build || "-"} · Windrose+ ${s.windrose_plus || "-"}`;
+      const modeText = caps.mode === "vanilla" ? "Vanilla mode" : `Windrose+ ${s.windrose_plus || "enabled"}`;
+      $("#server-line").textContent = `Invite ${s.invite_code || cfg.invite_code || "-"} · Version ${s.version || cfg.deployment_version || "-"} · Steam build ${liveVersion.build || "-"} · ${modeText}`;
       setText("#stat-service", servicePill(service.active_state));
       setText("#stat-uptime", fmtDate(service.active_since));
-      setText("#stat-players", `${s.player_count ?? 0}/${s.max_players ?? cfg.max_players ?? 0}`);
-      setText("#stat-invite", `Invite ${s.invite_code || cfg.invite_code || "-"}`);
+      setText("#stat-players", caps.live_players ? `${s.player_count ?? 0}/${s.max_players ?? cfg.max_players ?? 0}` : `?/${s.max_players ?? cfg.max_players ?? 0}`);
+      setText("#stat-invite", caps.live_players ? `Invite ${s.invite_code || cfg.invite_code || "-"}` : `Invite ${s.invite_code || cfg.invite_code || "-"} · live count unavailable`);
       setText("#stat-cpu", `${next.host.cpu_percent || 0}%`);
       setText("#stat-load", `Load ${(next.host.load || []).map(x => Number(x).toFixed(2)).join(" ")}`);
       setText("#stat-memory", `${mem.percent || 0}%`);
@@ -1286,12 +1372,23 @@ INDEX_HTML = r"""<!doctype html>
       setText("#stat-backups", fmtBytes(disk.free || 0) + " free");
       updateServiceButtons(service);
       const rcon = next.source_rcon || {};
-      $("#rcon-pill").className = `pill ${rcon.available ? "ok" : "warn"}`;
-      $("#rcon-pill").textContent = rcon.available ? "WindroseRCON ready" : "Kick/ban offline";
+      $("#rcon-pill").className = `pill ${rcon.available ? "ok" : (caps.mode === "vanilla" ? "" : "warn")}`;
+      $("#rcon-pill").textContent = rcon.available ? "Admin commands ready" : (caps.mode === "vanilla" ? "Vanilla mode" : "Kick/ban offline");
+      const playersNotice = $("#players-notice");
+      playersNotice.style.display = caps.live_players ? "none" : "block";
+      playersNotice.textContent = "Live player list and kick/ban are unavailable while UE4SS, Windrose+, and WindroseRCON are disabled for stability.";
+      const consoleNotice = $("#console-notice");
+      consoleNotice.style.display = caps.console ? "none" : "block";
+      consoleNotice.textContent = "Console commands are unavailable in vanilla mode. Service controls, config, backups, versions, and logs still work.";
+      $("#console-command").disabled = !caps.console;
+      $("#run-command").disabled = !caps.console;
+      if (!caps.console) $("#console-output").textContent = "Vanilla mode: no Windrose+ or WindroseRCON command backend is loaded.";
       const body = $("#players-body");
       body.innerHTML = "";
       const players = next.players || [];
-      if (!players.length) {
+      if (!caps.live_players) {
+        body.innerHTML = `<tr><td colspan="5" class="mini">Live player data unavailable in vanilla mode</td></tr>`;
+      } else if (!players.length) {
         body.innerHTML = `<tr><td colspan="5" class="mini">No players online</td></tr>`;
       } else {
         for (const p of players) {
@@ -1366,10 +1463,12 @@ INDEX_HTML = r"""<!doctype html>
       } catch (e) { $("#action-result").textContent = e.message; }
     }
     async function rollbackVersion(item, live) {
-      const count = Number(state?.windrose_plus?.status?.server?.player_count ?? state?.players?.length ?? 0);
+      const count = livePlayerCountForPrompt();
       let confirmPlayers = false;
       const label = `${item.version || "unknown version"} / build ${item.build || "-"}`;
-      if (count > 0) {
+      if (count === null) {
+        if (!confirm(`Switch to ${label}? Live player count is unavailable in vanilla mode, so this may disconnect anyone currently online.`)) return;
+      } else if (count > 0) {
         const typed = prompt(`${count} player${count === 1 ? "" : "s"} will be disconnected. Type ROLLBACK to switch to ${label}.`);
         if (typed !== "ROLLBACK") return;
         confirmPlayers = true;
@@ -1403,8 +1502,10 @@ INDEX_HTML = r"""<!doctype html>
         if (btn.disabled) return;
         const action = btn.dataset.service;
         if (action === "stop" || action === "restart") {
-          const count = Number(state?.windrose_plus?.status?.server?.player_count ?? state?.players?.length ?? 0);
-          if (count > 0) {
+          const count = livePlayerCountForPrompt();
+          if (count === null) {
+            if (!confirm(`${action} Windrose server? Live player count is unavailable in vanilla mode, so this may disconnect anyone currently online.`)) return;
+          } else if (count > 0) {
             const typed = prompt(`${count} player${count === 1 ? "" : "s"} will be kicked. Type ${action.toUpperCase()} to ${action} the server.`);
             if (typed !== action.toUpperCase()) return;
           } else if (!confirm(`${action} Windrose server?`)) {
@@ -1642,8 +1743,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 current = service_state(SERVICE_NAME)
                 active = current.get("active_state") == "active"
-                status = read_json(DATA_DIR / "server_status.json", {})
-                player_count = safe_int((status.get("server") or {}).get("player_count"))
+                player_count = live_player_count()
                 self.audit(
                     f"service action requested action={action} "
                     f"state={current.get('active_state')} players={player_count}"
@@ -1679,8 +1779,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/rollback":
                 snapshot_id = str(body.get("snapshot_id", ""))
-                status = read_json(DATA_DIR / "server_status.json", {})
-                player_count = safe_int((status.get("server") or {}).get("player_count"))
+                player_count = live_player_count()
                 if player_count > 0 and not body.get("confirm_players"):
                     self.send_json({"error": f"{player_count} players are online; confirmation is required"}, 409)
                     return
@@ -1693,8 +1792,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": "Command is required"}, 400)
                     return
                 if command.lower().startswith("wp."):
-                    self.send_json(windrose_plus_command(command))
+                    result = windrose_plus_command(command)
+                    self.send_json(result, 200 if result.get("ok") else 503)
                 else:
+                    if not mod_layer_state().get("admin_actions"):
+                        self.send_json({"ok": False, "error": "WindroseRCON is disabled; commands are unavailable in vanilla mode"}, 503)
+                        return
                     result = source_rcon_command(command)
                     self.send_json(result, 200 if result.get("ok") else 503)
                 return
@@ -1704,6 +1807,9 @@ class Handler(BaseHTTPRequestHandler):
                 reason = str(body.get("reason", "")).strip()
                 if action not in {"kick", "ban"} or not account_id:
                     self.send_json({"error": "Invalid player action"}, 400)
+                    return
+                if not mod_layer_state().get("admin_actions"):
+                    self.send_json({"error": "Kick/ban are unavailable in vanilla mode because WindroseRCON is disabled"}, 503)
                     return
                 command = f"kick {account_id}" if action == "kick" else f"ban {account_id} {reason or 'Banned from panel'}"
                 result = source_rcon_command(command)
