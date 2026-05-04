@@ -188,6 +188,38 @@ def parse_systemd_timestamp(value: str) -> float | None:
         return None
 
 
+def runtime_state_timestamp() -> float | None:
+    state = read_json(CONTROL_DIR / "runtime_state.json", {})
+    ts = safe_int(state.get("timestamp"), 0) if isinstance(state, dict) else 0
+    return float(ts) if ts > 0 else None
+
+
+def parse_game_log_timestamp(line: str) -> float | None:
+    match = re.match(r"^\[(\d{4})\.(\d{2})\.(\d{2})-(\d{2})\.(\d{2})\.(\d{2})", line)
+    if not match:
+        return None
+    year, month, day, hour, minute, second = [int(part) for part in match.groups()]
+    try:
+        return dt.datetime(year, month, day, hour, minute, second, tzinfo=dt.UTC).timestamp()
+    except ValueError:
+        return None
+
+
+def game_log_since(text: str, start_ts: float | None) -> str:
+    if start_ts is None:
+        return text
+    lines: list[str] = []
+    current_ts: float | None = None
+    threshold = start_ts - 5
+    for line in text.splitlines():
+        parsed_ts = parse_game_log_timestamp(line)
+        if parsed_ts is not None:
+            current_ts = parsed_ts
+        if current_ts is not None and current_ts >= threshold:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def manifest_build(root: Path) -> str:
     manifest = root / "steamapps" / f"appmanifest_{APP_ID}.acf"
     text = tail_file(manifest, 20000)
@@ -742,6 +774,8 @@ def join_state(service: dict[str, Any]) -> dict[str, Any]:
 
     log_path = GAME_DIR / "R5" / "Saved" / "Logs" / "R5.log"
     active_ts = parse_systemd_timestamp(str(service.get("active_since") or ""))
+    if active_ts is None:
+        active_ts = runtime_state_timestamp()
     try:
         log_mtime = log_path.stat().st_mtime
     except OSError:
@@ -749,7 +783,9 @@ def join_state(service: dict[str, Any]) -> dict[str, Any]:
     if active_ts is not None and log_mtime + 5 < active_ts:
         return {"state": "starting", "joinable": False, "message": "Waiting for current boot log"}
 
-    text = tail_file(log_path, 240_000)
+    text = game_log_since(tail_file(log_path, 240_000), active_ts)
+    if active_ts is not None and not text:
+        return {"state": "starting", "joinable": False, "message": "Waiting for current boot log"}
     if READY_MARKER in text:
         return {"state": "ready", "joinable": True, "message": "Invite/direct join is ready"}
 
