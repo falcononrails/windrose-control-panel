@@ -7,6 +7,7 @@ It is designed for community servers that run Windrose+ and optionally WindroseR
 ## Features
 
 - Live Windrose status from Windrose+
+- Join readiness from the game log, so a running-but-unregistered server is shown separately from a joinable one
 - CPU, memory, disk, process, and service state
 - Start, stop, and restart the Windrose systemd service
 - State-aware service controls that disable invalid actions like starting an already-running server
@@ -23,9 +24,23 @@ It is designed for community servers that run Windrose+ and optionally WindroseR
 ## Requirements
 
 - Linux server with Python 3
-- A Windrose server managed by systemd
+- A Windrose server managed by systemd, or the container wrapper in this repository
 - Windrose+ installed and writing `windrose_plus_data/server_status.json`
 - Optional: WindroseRCON on `127.0.0.1:27065`
+
+## Bundled Container Mode
+
+This panel is bundled into `ghcr.io/falcononrails/windrose-arm64-server`. In that mode, the container wrapper starts the panel, proxies start/stop/restart actions through `/server/windrose_panel_data/command.json`, and stores saved install snapshots in `/versions`.
+
+For the bundled image, configure the panel with the root repository `.env` file:
+
+```env
+ENABLE_WINDROSE_PLUS=true
+ENABLE_PANEL=true
+PANEL_PORT=8790
+```
+
+See the root README for Docker Compose, volume, and password details. The install steps below are for standalone systemd deployments.
 
 The default paths match an ARM Oracle Cloud setup:
 

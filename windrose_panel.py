@@ -38,17 +38,31 @@ DASHBOARD_SERVICE = os.getenv("WINDROSE_PLUS_SERVICE", "windrose-plus-dashboard.
 SOURCE_RCON_HOST = os.getenv("SOURCE_RCON_HOST", "127.0.0.1")
 SOURCE_RCON_PORT = int(os.getenv("SOURCE_RCON_PORT", "27065"))
 APP_ID = os.getenv("WINDROSE_APP_ID", "4129620")
-INSTALL_PARENT = GAME_DIR.parent
+PANEL_MODE = os.getenv("WINDROSE_PANEL_MODE", "auto").strip().lower()
+CONTROL_DIR = Path(os.getenv("WINDROSE_CONTROL_DIR", str(GAME_DIR / "windrose_panel_data")))
+INSTALL_PARENT = Path(os.getenv("WINDROSE_INSTALL_PARENT", str(GAME_DIR.parent)))
 PIN_FILE = Path(os.getenv("WINDROSE_VERSION_PIN_FILE", str(INSTALL_PARENT / "version-pin.json")))
 UPDATE_LOG = Path(os.getenv("WINDROSE_UPDATE_LOG", "/var/log/windrose-update.log"))
 ROLLBACK_LOG = Path(os.getenv("WINDROSE_ROLLBACK_LOG", "/var/log/windrose-rollback.log"))
 STEAM_LATEST_CACHE = Path(os.getenv("WINDROSE_STEAM_LATEST_CACHE", str(INSTALL_PARENT / "steam-latest.json")))
 SNAPSHOT_PREFIXES = ("server-before-update-", "server-before-rollback-", "server-snapshot-")
+READY_MARKER = "Host server is ready for owner to connect"
+BROKEN_REGISTRATION_MARKERS = (
+    "SetBrokenState",
+    "Cannot create Coop NetServer",
+    "Server Authorization failed",
+    "Server registration finished with error",
+    "Cannot establish connection to HTTP server",
+)
 RUNTIME_PATHS = (
     "R5/Saved",
     "R5/ServerDescription.json",
+    ".windrose_panel_password",
+    ".windrose_panel_secret",
     ".windrose_plus_dashboard_password",
+    ".windrose_plus_rcon_password",
     "windrose_plus.json",
+    "windrose_panel_data",
     "UE4SS-settings.ini",
     "WindrosePlus",
     "windrose_plus",
@@ -137,12 +151,41 @@ def tail_file(path: Path, max_bytes: int = 12000) -> str:
         return ""
 
 
+def panel_mode() -> str:
+    if PANEL_MODE in {"systemd", "container"}:
+        return PANEL_MODE
+    if Path("/run/systemd/system").exists() and shutil.which("systemctl"):
+        return "systemd"
+    return "container"
+
+
+def is_container_mode() -> bool:
+    return panel_mode() == "container"
+
+
+def ensure_install_parent_safe() -> None:
+    game = GAME_DIR.resolve()
+    parent = INSTALL_PARENT.resolve()
+    if parent == game or game in parent.parents:
+        raise ValueError("WINDROSE_INSTALL_PARENT must not be inside WINDROSE_GAME_DIR")
+
+
 def utc_stamp() -> str:
     return dt.datetime.now(dt.UTC).strftime("%Y%m%d_%H%M%S")
 
 
 def iso_from_ts(ts: float) -> str:
     return dt.datetime.fromtimestamp(ts, dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_systemd_timestamp(value: str) -> float | None:
+    value = value.strip()
+    if not value or value.lower() == "n/a":
+        return None
+    try:
+        return dt.datetime.strptime(value, "%a %Y-%m-%d %H:%M:%S %Z").replace(tzinfo=dt.UTC).timestamp()
+    except ValueError:
+        return None
 
 
 def manifest_build(root: Path) -> str:
@@ -372,18 +415,73 @@ def versions_state() -> dict[str, Any]:
     }
 
 
+def process_rows() -> list[dict[str, Any]]:
+    out = run(["ps", "-eo", "pid,pcpu,rss,args"], timeout=5)
+    rows = []
+    for line in out["stdout"].splitlines()[1:]:
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            rows.append({
+                "pid": int(parts[0]),
+                "cpu": float(parts[1]),
+                "rss": int(parts[2]) * 1024,
+                "args": parts[3],
+            })
+        except ValueError:
+            continue
+    return rows
+
+
+def rows_for_process(*needles: str) -> list[dict[str, Any]]:
+    return [
+        row for row in process_rows()
+        if any(needle in row["args"] for needle in needles)
+    ]
+
+
+def write_control_command(action: str) -> None:
+    CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(CONTROL_DIR / "command.json", {
+        "action": action,
+        "source": "panel",
+        "timestamp": int(time.time()),
+    })
+
+
+def container_service_state(service: str) -> dict[str, Any]:
+    if service == SERVICE_NAME:
+        rows = rows_for_process("WindroseServer-Win64-Shipping.exe", "xvfb-run -a wine")
+    else:
+        rows = rows_for_process("windrose_plus_server.ps1")
+    main_pid = rows[0]["pid"] if rows else 0
+    memory = sum(row["rss"] for row in rows)
+    return {
+        "active_state": "active" if rows else "inactive",
+        "sub_state": "running" if rows else "dead",
+        "main_pid": main_pid,
+        "memory_current": memory,
+        "active_since": "",
+        "restarts": 0,
+    }
+
+
 def create_install_snapshot(reason: str = "manual") -> dict[str, Any]:
+    ensure_install_parent_safe()
     build = manifest_build(GAME_DIR) or "unknown"
     safe_reason = re.sub(r"[^a-z0-9-]+", "-", reason.lower()).strip("-") or "manual"
     target = INSTALL_PARENT / f"server-snapshot-{safe_reason}-{build}-{utc_stamp()}"
     if target.exists():
         raise ValueError("Snapshot target already exists")
+    INSTALL_PARENT.mkdir(parents=True, exist_ok=True)
     append_rollback_log(f"snapshot start target={target}")
     out = run(["cp", "-a", str(GAME_DIR), str(target)], timeout=900)
     if not out["ok"]:
         append_rollback_log(f"snapshot failed target={target} error={out['stderr'] or out['stdout']}")
         raise RuntimeError(out["stderr"] or out["stdout"] or "Snapshot failed")
-    run(["chown", "-R", "ubuntu:ubuntu", str(target)], timeout=180)
+    owner = f"{os.getuid()}:{os.getgid()}" if is_container_mode() else "ubuntu:ubuntu"
+    run(["chown", "-R", owner, str(target)], timeout=180)
     append_rollback_log(f"snapshot complete target={target} build={build}")
     return version_entry(target)
 
@@ -429,6 +527,68 @@ def clear_volatile_runtime(root: Path) -> None:
                     append_rollback_log(f"could not clear volatile rcon file {path}: {exc}")
 
 
+def empty_directory(path: Path) -> None:
+    for child in path.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def wait_for_container_service(active: bool, timeout: int = 120) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = container_service_state(SERVICE_NAME)
+        is_active = state["active_state"] == "active"
+        if is_active == active:
+            return True
+        time.sleep(1)
+    return False
+
+
+def stop_service_for_swap() -> None:
+    if is_container_mode():
+        write_control_command("stop")
+        if not wait_for_container_service(False, 120):
+            raise RuntimeError("Timed out waiting for Windrose to stop")
+        return
+
+    stop = run(["systemctl", "stop", SERVICE_NAME], timeout=90)
+    if not stop["ok"]:
+        append_rollback_log(f"rollback stop failed error={stop['stderr'] or stop['stdout']}")
+        raise RuntimeError(stop["stderr"] or stop["stdout"] or "Failed to stop Windrose")
+
+
+def start_service_after_swap() -> None:
+    if is_container_mode():
+        write_control_command("start")
+        return
+
+    start = run(["systemctl", "start", "--no-block", SERVICE_NAME], timeout=20)
+    if not start["ok"]:
+        append_rollback_log(f"rollback start failed error={start['stderr'] or start['stdout']}")
+        raise RuntimeError(start["stderr"] or start["stdout"] or "Rollback swapped files but service did not start")
+
+
+def swap_install(stage: Path, current_snapshot: Path, selected_snapshot: Path) -> None:
+    ensure_install_parent_safe()
+    if is_container_mode():
+        current_snapshot.mkdir(parents=True)
+        copy_current = run(["cp", "-a", f"{GAME_DIR}/.", str(current_snapshot)], timeout=900)
+        if not copy_current["ok"]:
+            raise RuntimeError(copy_current["stderr"] or copy_current["stdout"] or "Failed to snapshot current install")
+        empty_directory(GAME_DIR)
+        copy_stage = run(["cp", "-a", f"{stage}/.", str(GAME_DIR)], timeout=900)
+        if not copy_stage["ok"]:
+            raise RuntimeError(copy_stage["stderr"] or copy_stage["stdout"] or "Failed to install selected version")
+        run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", str(GAME_DIR), str(current_snapshot), str(selected_snapshot)], timeout=240)
+        return
+
+    shutil.move(str(GAME_DIR), str(current_snapshot))
+    shutil.move(str(stage), str(GAME_DIR))
+    run(["chown", "-R", "ubuntu:ubuntu", str(GAME_DIR), str(current_snapshot), str(selected_snapshot)], timeout=240)
+
+
 def rollback_to_snapshot(snapshot_id: str) -> dict[str, Any]:
     snapshot = resolve_snapshot(snapshot_id)
     target_build = manifest_build(snapshot)
@@ -452,10 +612,7 @@ def rollback_to_snapshot(snapshot_id: str) -> dict[str, Any]:
         f"current_build={current_build} save_backup={backup.get('path')}"
     )
 
-    stop = run(["systemctl", "stop", SERVICE_NAME], timeout=90)
-    if not stop["ok"]:
-        append_rollback_log(f"rollback stop failed error={stop['stderr'] or stop['stdout']}")
-        raise RuntimeError(stop["stderr"] or stop["stdout"] or "Failed to stop Windrose")
+    stop_service_for_swap()
 
     try:
         stage.mkdir(parents=True)
@@ -464,10 +621,10 @@ def rollback_to_snapshot(snapshot_id: str) -> dict[str, Any]:
             raise RuntimeError(copy["stderr"] or copy["stdout"] or "Failed to stage rollback snapshot")
         copy_runtime_data(GAME_DIR, stage)
         clear_volatile_runtime(stage)
-        shutil.move(str(GAME_DIR), str(current_snapshot))
-        shutil.move(str(stage), str(GAME_DIR))
-        run(["chown", "-R", "ubuntu:ubuntu", str(GAME_DIR), str(current_snapshot), str(snapshot)], timeout=240)
+        swap_install(stage, current_snapshot, snapshot)
         write_version_pin(target_build, f"rollback to {snapshot.name}")
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
     except Exception as exc:
         append_rollback_log(f"rollback swap failed error={exc}")
         if stage.exists():
@@ -475,10 +632,7 @@ def rollback_to_snapshot(snapshot_id: str) -> dict[str, Any]:
         raise
 
     append_rollback_log(f"rollback service start requested build={target_build}")
-    start = run(["systemctl", "start", "--no-block", SERVICE_NAME], timeout=20)
-    if not start["ok"]:
-        append_rollback_log(f"rollback start failed error={start['stderr'] or start['stdout']}")
-        raise RuntimeError(start["stderr"] or start["stdout"] or "Rollback swapped files but service did not start")
+    start_service_after_swap()
 
     append_rollback_log(f"rollback complete active_build={target_build} previous_saved={current_snapshot}")
     return {
@@ -492,6 +646,9 @@ def rollback_to_snapshot(snapshot_id: str) -> dict[str, Any]:
 
 
 def service_state(service: str) -> dict[str, Any]:
+    if is_container_mode():
+        return container_service_state(service)
+
     out = run(["systemctl", "show", service, "--no-page",
                "-p", "ActiveState", "-p", "SubState", "-p", "MainPID",
                "-p", "MemoryCurrent", "-p", "ActiveEnterTimestamp",
@@ -567,26 +724,40 @@ def disk_info() -> dict[str, Any]:
 
 
 def process_info() -> dict[str, Any]:
-    out = run(["ps", "-eo", "pid,pcpu,rss,args"], timeout=5)
     rows = []
     total_cpu = 0.0
     total_rss = 0
-    for line in out["stdout"].splitlines()[1:]:
-        if "WindroseServer-Win64-Shipping.exe" not in line and "xvfb-run -a wine" not in line:
+    for row in process_rows():
+        if "WindroseServer-Win64-Shipping.exe" not in row["args"] and "xvfb-run -a wine" not in row["args"]:
             continue
-        parts = line.strip().split(None, 3)
-        if len(parts) < 4:
-            continue
-        try:
-            pid = int(parts[0])
-            pcpu = float(parts[1])
-            rss = int(parts[2]) * 1024
-        except ValueError:
-            continue
-        total_cpu += pcpu
-        total_rss += rss
-        rows.append({"pid": pid, "cpu": pcpu, "rss": rss, "args": parts[3]})
+        total_cpu += row["cpu"]
+        total_rss += row["rss"]
+        rows.append(row)
     return {"cpu": round(total_cpu, 1), "rss": total_rss, "processes": rows}
+
+
+def join_state(service: dict[str, Any]) -> dict[str, Any]:
+    if service.get("active_state") != "active":
+        return {"state": "offline", "joinable": False, "message": "Server process is not running"}
+
+    log_path = GAME_DIR / "R5" / "Saved" / "Logs" / "R5.log"
+    active_ts = parse_systemd_timestamp(str(service.get("active_since") or ""))
+    try:
+        log_mtime = log_path.stat().st_mtime
+    except OSError:
+        return {"state": "starting", "joinable": False, "message": "Waiting for game log"}
+    if active_ts is not None and log_mtime + 5 < active_ts:
+        return {"state": "starting", "joinable": False, "message": "Waiting for current boot log"}
+
+    text = tail_file(log_path, 240_000)
+    if READY_MARKER in text:
+        return {"state": "ready", "joinable": True, "message": "Invite/direct join is ready"}
+
+    for marker in BROKEN_REGISTRATION_MARKERS:
+        if marker in text:
+            return {"state": "registration_failed", "joinable": False, "message": marker}
+
+    return {"state": "starting", "joinable": False, "message": "Waiting for Windrose host registration"}
 
 
 def get_windrose_plus_password() -> str:
@@ -903,6 +1074,7 @@ def create_backup() -> dict[str, Any]:
 def build_state() -> dict[str, Any]:
     windrose_service = service_state(SERVICE_NAME)
     dashboard_service = service_state(DASHBOARD_SERVICE)
+    windrose_join = join_state(windrose_service)
     capabilities = mod_layer_state(dashboard_service)
     raw_status = read_json(DATA_DIR / "server_status.json", {})
     status = raw_status if capabilities.get("live_players") else {}
@@ -954,6 +1126,7 @@ def build_state() -> dict[str, Any]:
             "windrose": windrose_service,
             "windrose_plus": dashboard_service,
         },
+        "join": windrose_join,
         "capabilities": capabilities,
         "host": {
             "cpu_percent": cpu_percent(),
@@ -1263,6 +1436,17 @@ INDEX_HTML = r"""<!doctype html>
     };
     function setText(id, value) { $(id).textContent = value ?? "-"; }
     function servicePill(active) { return active === "active" ? "Online" : active || "Unknown"; }
+    function joinLabel(join, service) {
+      if (service.active_state !== "active") return servicePill(service.active_state);
+      if (join?.state === "ready") return "Joinable";
+      if (join?.state === "registration_failed") return "Registration failed";
+      if (join?.state === "starting") return "Starting";
+      return servicePill(service.active_state);
+    }
+    function joinHint(join, service) {
+      if (join?.state === "ready") return fmtDate(service.active_since);
+      return join?.message || fmtDate(service.active_since);
+    }
     function serviceActionDisabled(action, service) {
       const active = service.active_state === "active";
       const changing = ["activating", "deactivating", "reloading"].includes(service.active_state);
@@ -1357,11 +1541,12 @@ INDEX_HTML = r"""<!doctype html>
       const proc = next.host.process || {};
       const cfg = next.server_config || {};
       const caps = next.capabilities || {};
+      const join = next.join || {};
       $("#server-name").textContent = s.name || cfg.server_name || "Windrose";
       const modeText = caps.mode === "vanilla" ? "Vanilla mode" : `Windrose+ ${s.windrose_plus || "enabled"}`;
-      $("#server-line").textContent = `Invite ${s.invite_code || cfg.invite_code || "-"} · Version ${s.version || cfg.deployment_version || "-"} · Steam build ${liveVersion.build || "-"} · ${modeText}`;
-      setText("#stat-service", servicePill(service.active_state));
-      setText("#stat-uptime", fmtDate(service.active_since));
+      $("#server-line").textContent = `Invite ${s.invite_code || cfg.invite_code || "-"} · Version ${s.version || cfg.deployment_version || "-"} · Steam build ${liveVersion.build || "-"} · ${modeText} · ${joinLabel(join, service)}`;
+      setText("#stat-service", joinLabel(join, service));
+      setText("#stat-uptime", joinHint(join, service));
       setText("#stat-players", caps.live_players ? `${s.player_count ?? 0}/${s.max_players ?? cfg.max_players ?? 0}` : `?/${s.max_players ?? cfg.max_players ?? 0}`);
       setText("#stat-invite", caps.live_players ? `Invite ${s.invite_code || cfg.invite_code || "-"}` : `Invite ${s.invite_code || cfg.invite_code || "-"} · live count unavailable`);
       setText("#stat-cpu", `${next.host.cpu_percent || 0}%`);
@@ -1692,7 +1877,17 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/logs":
                 if not self.require_auth():
                     return
-                journal = run(["journalctl", "-u", SERVICE_NAME, "-n", "180", "--no-pager"], timeout=8)
+                journal_text = ""
+                if is_container_mode():
+                    journal_text = (
+                        "--- Panel log ---\n"
+                        + tail_file(CONTROL_DIR / "panel.log", 9000)
+                        + "\n\n--- Windrose+ dashboard log ---\n"
+                        + tail_file(DATA_DIR / "dashboard.log", 9000)
+                    )
+                else:
+                    journal = run(["journalctl", "-u", SERVICE_NAME, "-n", "180", "--no-pager"], timeout=8)
+                    journal_text = journal["stdout"]
                 game_log_dir = GAME_DIR / "R5" / "Saved" / "Logs"
                 latest_log = ""
                 try:
@@ -1700,7 +1895,7 @@ class Handler(BaseHTTPRequestHandler):
                     latest_log = tail_file(logs[0], 9000) if logs else ""
                 except Exception:
                     latest_log = ""
-                self.send_json({"logs": (journal["stdout"] + "\n\n--- Game log ---\n" + latest_log).strip()})
+                self.send_json({"logs": (journal_text + "\n\n--- Game log ---\n" + latest_log).strip()})
                 return
             if path == "/" or path == "/index.html":
                 if not self.require_auth():
@@ -1753,6 +1948,10 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if action == "stop" and not active:
                     self.send_json({"error": "Server is not running", "state": current}, 409)
+                    return
+                if is_container_mode():
+                    write_control_command(action)
+                    self.send_json({"ok": True, "message": f"{action} requested", "state": current})
                     return
                 out = run(["systemctl", action, SERVICE_NAME], timeout=20)
                 self.send_json({"ok": out["ok"], "message": out["stderr"] or out["stdout"] or f"{action} sent"}, 200 if out["ok"] else 500)
