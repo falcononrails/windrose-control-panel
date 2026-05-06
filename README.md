@@ -1,5 +1,8 @@
 # Windrose Control Panel
 
+> [!IMPORTANT]
+> This standalone panel is archived. The maintained panel now lives inside the ARM64 Docker image and repository: [falcononrails/windrose-arm64-server](https://github.com/falcononrails/windrose-arm64-server).
+
 A small self-hosted web panel for Windrose dedicated servers.
 
 It is designed for community servers that run Windrose+ and optionally WindroseRCON. The panel keeps host metrics, server controls, backups, config editing, Windrose+ commands, logs, and player actions in one place.
